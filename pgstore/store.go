@@ -26,6 +26,19 @@ func New(pool *pgxpool.Pool) *Store {
 	return &Store{pool: pool}
 }
 
+// AutoMigrate creates and updates the governance schema tables using embedded migrations.
+func (s *Store) AutoMigrate(ctx context.Context) error {
+	if s.pool == nil {
+		return errors.New("pgstore: cannot AutoMigrate without *pgxpool.Pool")
+	}
+	return MigrateUpPool(ctx, s.pool)
+}
+
+// Pool returns the underlying *pgxpool.Pool.
+func (s *Store) Pool() *pgxpool.Pool {
+	return s.pool
+}
+
 func (s *Store) withTenantTx(ctx context.Context, orgID uuid.UUID, fn func(tx pgx.Tx) error) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {

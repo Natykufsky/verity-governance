@@ -22,11 +22,40 @@ func GetMigrationsFS() fs.FS {
 }
 
 // MigrateUp executes all embedded *.up.sql migration scripts in order via *sql.DB.
+// It tracks applied versions in "verity_governance_schema_migrations".
 func MigrateUp(ctx context.Context, db *sql.DB) error {
-	return runSQLMigrations(ctx, ".up.sql", false, func(sqlText string) error {
-		_, err := db.ExecContext(ctx, sqlText)
-		return err
-	})
+	trackTableQuery := `
+		CREATE TABLE IF NOT EXISTS verity_governance_schema_migrations (
+			version VARCHAR(255) PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+	`
+	if _, err := db.ExecContext(ctx, trackTableQuery); err != nil {
+		return fmt.Errorf("pgstore: failed to ensure verity_governance_schema_migrations table: %w", err)
+	}
+
+	return runTrackedSQLMigrations(ctx, ".up.sql", false,
+		func(version string) (bool, error) {
+			var exists bool
+			err := db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM verity_governance_schema_migrations WHERE version = $1)`, version).Scan(&exists)
+			return exists, err
+		},
+		func(version string, sqlText string) error {
+			tx, err := db.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, sqlText); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO verity_governance_schema_migrations (version) VALUES ($1)`, version); err != nil {
+				_ = tx.Rollback()
+				return err
+			}
+			return tx.Commit()
+		},
+	)
 }
 
 // MigrateDown executes all embedded *.down.sql migration scripts in reverse order via *sql.DB.
@@ -38,11 +67,40 @@ func MigrateDown(ctx context.Context, db *sql.DB) error {
 }
 
 // MigrateUpPool executes all embedded *.up.sql migration scripts in order via *pgxpool.Pool.
+// It tracks applied versions in "verity_governance_schema_migrations".
 func MigrateUpPool(ctx context.Context, pool *pgxpool.Pool) error {
-	return runSQLMigrations(ctx, ".up.sql", false, func(sqlText string) error {
-		_, err := pool.Exec(ctx, sqlText)
-		return err
-	})
+	trackTableQuery := `
+		CREATE TABLE IF NOT EXISTS verity_governance_schema_migrations (
+			version VARCHAR(255) PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		);
+	`
+	if _, err := pool.Exec(ctx, trackTableQuery); err != nil {
+		return fmt.Errorf("pgstore: failed to ensure verity_governance_schema_migrations table: %w", err)
+	}
+
+	return runTrackedSQLMigrations(ctx, ".up.sql", false,
+		func(version string) (bool, error) {
+			var exists bool
+			err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM verity_governance_schema_migrations WHERE version = $1)`, version).Scan(&exists)
+			return exists, err
+		},
+		func(version string, sqlText string) error {
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+
+			if _, err := tx.Exec(ctx, sqlText); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO verity_governance_schema_migrations (version) VALUES ($1)`, version); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		},
+	)
 }
 
 // MigrateDownPool executes all embedded *.down.sql migration scripts in reverse order via *pgxpool.Pool.
@@ -51,6 +109,42 @@ func MigrateDownPool(ctx context.Context, pool *pgxpool.Pool) error {
 		_, err := pool.Exec(ctx, sqlText)
 		return err
 	})
+}
+
+func runTrackedSQLMigrations(_ context.Context, suffix string, reverse bool, checkFn func(string) (bool, error), execFn func(string, string) error) error {
+	entries, err := migrationsFS.ReadDir("migrations")
+	if err != nil {
+		return fmt.Errorf("pgstore: read embedded migrations dir: %w", err)
+	}
+	var files []string
+	for _, entry := range entries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), suffix) {
+			files = append(files, entry.Name())
+		}
+	}
+	if reverse {
+		sort.Sort(sort.Reverse(sort.StringSlice(files)))
+	} else {
+		sort.Strings(files)
+	}
+	for _, f := range files {
+		applied, err := checkFn(f)
+		if err != nil {
+			return fmt.Errorf("pgstore: check migration %s: %w", f, err)
+		}
+		if applied {
+			continue
+		}
+
+		b, err := migrationsFS.ReadFile("migrations/" + f)
+		if err != nil {
+			return fmt.Errorf("pgstore: read file %s: %w", f, err)
+		}
+		if err := execFn(f, string(b)); err != nil {
+			return fmt.Errorf("pgstore: apply migration %s: %w", f, err)
+		}
+	}
+	return nil
 }
 
 func runSQLMigrations(_ context.Context, suffix string, reverse bool, execFn func(string) error) error {
